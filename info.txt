@@ -1,0 +1,48 @@
+on Spring HTTP Interface Client puoi passare la API key come header HTTP. Se è una API key fissa per quel client, ti consiglio di non metterla nella firma di ogni metodo, ma configurarla una volta sola.
+Esempio: X-API-Key
+@HttpExchange("/api")
+public interface RemoteAiClient {
+
+    @PostExchange("/chat")
+    AiResponse chat(@RequestBody AiRequest request);
+}
+Configurazione:
+@Configuration
+public class AiClientConfig {
+
+    @Bean
+    RemoteAiClient remoteAiClient(
+            RestClient.Builder restClientBuilder,
+            @Value("${remote.api-key}") String apiKey) {
+
+        RestClient restClient = restClientBuilder
+                .baseUrl("https://remote-server.it")
+                .defaultHeader("X-API-Key", apiKey)
+                .build();
+
+        HttpServiceProxyFactory factory =
+                HttpServiceProxyFactory
+                        .builderFor(RestClientAdapter.create(restClient))
+                        .build();
+
+        return factory.createClient(RemoteAiClient.class);
+    }
+}
+Nel application.yml:
+remote:
+  api-key: ${REMOTE_API_KEY}
+Quindi:
+export REMOTE_API_KEY="abc123..."
+e quando fai:
+remoteAiClient.chat(request);
+Spring invia automaticamente:
+POST /api/chat
+X-API-Key: abc123...
+Content-Type: application/json
+Se invece è Authorization: Bearer
+Ancora più comune per API AI:
+.defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer " + apiKey)
+che produce:
+Authorization: Bearer abc123...
+Questo è probabilmente il modo che cerchi: nel tuo AiClient non devi gestire né RestClient né header né API key; tutta la configurazione HTTP rimane nel @Configuration.
+Se però stai usando Spring AI ChatClient / OpenAiChatModel e vuoi che il tuo AiClient chiami un altro servizio Spring AI, posso mostrarti anche la configurazione esatta con `@HttpExchange` + API key + `ChatClient`.
