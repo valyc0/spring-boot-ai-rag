@@ -7,12 +7,14 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 import jakarta.validation.Valid;
+import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import reactor.core.publisher.Flux;
 
 @RestController
 @RequestMapping("/api/es")
@@ -35,13 +37,29 @@ public class CustomIngestController {
     @GetMapping("/query")
     public CustomAiSearchResponse query(@RequestParam String question,
             @RequestParam(required = false, defaultValue = "3") int topK,
+            @RequestParam(required = false, defaultValue = "default") String conversationId,
             @RequestParam Map<String, String> allParams) throws Exception {
         // allParams contiene TUTTI i query param (Spring popola così una Map senza "name"):
         // si estraggono solo i campi effettivamente filtrabili, ignorando gli altri.
         Map<String, String> filters = allParams.entrySet().stream()
                 .filter(e -> FILTERABLE_FIELDS.contains(e.getKey()))
                 .collect(Collectors.toUnmodifiableMap(Map.Entry::getKey, Map.Entry::getValue));
-        return aiSearch.search(question, filters, topK);
+        return aiSearch.search(question, filters, topK, conversationId);
+    }
+
+    /**
+     * Come {@code /query} ma la risposta del LLM arriva in streaming (text/event-stream): un evento
+     * SSE per ogni pezzo di testo. Usa {@code conversationId} per mantenere la memoria di conversazione.
+     */
+    @GetMapping(value = "/query/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public Flux<String> queryStream(@RequestParam String question,
+            @RequestParam(required = false, defaultValue = "3") int topK,
+            @RequestParam(required = false, defaultValue = "default") String conversationId,
+            @RequestParam Map<String, String> allParams) throws Exception {
+        Map<String, String> filters = allParams.entrySet().stream()
+                .filter(e -> FILTERABLE_FIELDS.contains(e.getKey()))
+                .collect(Collectors.toUnmodifiableMap(Map.Entry::getKey, Map.Entry::getValue));
+        return aiSearch.searchStream(question, filters, topK, conversationId);
     }
 
     @PostMapping("/documents")

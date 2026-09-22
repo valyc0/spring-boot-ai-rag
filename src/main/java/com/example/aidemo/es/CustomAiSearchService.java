@@ -11,8 +11,13 @@ import co.elastic.clients.elasticsearch._types.query_dsl.Query;
 import co.elastic.clients.elasticsearch.core.SearchRequest;
 import co.elastic.clients.elasticsearch.core.search.Hit;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
+import org.springframework.ai.chat.memory.ChatMemory;
 import org.springframework.ai.embedding.EmbeddingModel;
 import org.springframework.stereotype.Service;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import reactor.core.publisher.Flux;
 
 /**
  * Query AI "custom" sull'indice {@code custom-documents}.
@@ -28,37 +33,101 @@ import org.springframework.stereotype.Service;
 @Service
 public class CustomAiSearchService {
 
+    private static final Logger log = LoggerFactory.getLogger(CustomAiSearchService.class);
+
     private final EmbeddingModel embeddingModel;
     private final ElasticsearchClient client;
     private final ChatClient chatClient;
 
     public CustomAiSearchService(EmbeddingModel embeddingModel, ElasticsearchClient client,
-            ChatClient.Builder builder) {
+            ChatClient.Builder builder, ChatMemory chatMemory) {
         this.embeddingModel = embeddingModel;
         this.client = client;
         // Stesso prompt di sistema della RAG Spring AI: rispondi SOLO col contesto fornito.
+        // MessageChatMemoryAdvisor tiene in memoria (in-memory) le conversazioni per conversationId,
+        // così le domande successive possono riferirsi alle risposte precedenti.
         this.chatClient = builder
                 .defaultSystem("""
                         You are the internal assistant of an example company.
                         Answer only using the provided context. If the answer is not
                         in the context, say that you do not know.
                         """)
+                .defaultAdvisors(MessageChatMemoryAdvisor.builder(chatMemory).build())
                 .build();
     }
 
     /**
      * Esegue il retrieval vettoriale sui chunk custom e genera la risposta del LLM.
      *
-     * @param query   la domanda dell'utente
-     * @param filters mappa campo-top-level -> valore (es. {@code contentId}, {@code langId},
-     *                {@code department}); vengono applicati come {@code term} query DENTRO la kNN
-     * @param topK    numero di chunk più simili da recuperare
+     * @param query          la domanda dell'utente
+     * @param filters        mappa campo-top-level -> valore (es. {@code contentId}, {@code langId},
+     *                       {@code department}); vengono applicati come {@code term} query DENTRO la kNN
+     * @param topK           numero di chunk più simili da recuperare
+     * @param conversationId id della conversazione (memoria in-memory, consente follow-up)
      * @return risposta testuale del modello + hits recuperati (campi top-level e score)
      */
-    public CustomAiSearchResponse search(String query, Map<String, String> filters, int topK) throws Exception {
+    public CustomAiSearchResponse search(String query, Map<String, String> filters, int topK, String conversationId)
+            throws Exception {
+        log.debug("Query AI (sincrona) arrivata: query={}, filters={}, topK={}, conversationId={}",
+                query, filters, topK, conversationId);
+        List<CustomAiSearchResponse.Hit> hits = retrieveHits(query, filters, topK);
+
+        // Nessun chunk rilevante: risposta cortese, senza chiamare il LLM.
+        if (hits.isEmpty()) {
+            log.debug("Nessun chunk recuperato, risposta senza chiamata al LLM");
+            return new CustomAiSearchResponse("Nessun documento trovato nel contesto richiesto.", List.of());
+        }
+
+        String answer = chatClient.prompt()
+                .user("Domanda: " + query + "\n\nContesto:\n" + buildContext(hits))
+                .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, conversationId))
+                .call()
+                .content();
+
+        log.debug("Risposta LLM (sincrona): {}", answer);
+        return new CustomAiSearchResponse(answer, hits);
+    }
+
+    /**
+     * Come {@link #search(String, Map, int, String)} ma la risposta del LLM viene restituita in streaming,
+     * token per token. I hit recuperati NON vengono inviati (solo testo).
+     *
+     * @param query          la domanda dell'utente
+     * @param filters        mappa campo-top-level -> valore applicata come {@code term} query dentro la kNN
+     * @param topK           numero di chunk più simili da recuperare
+     * @param conversationId id della conversazione (memoria in-memory, consente follow-up)
+     * @return stream di pezzi di testo della risposta del modello
+     */
+    public Flux<String> searchStream(String query, Map<String, String> filters, int topK, String conversationId)
+            throws Exception {
+        log.debug("Query AI (streaming) arrivata: query={}, filters={}, topK={}, conversationId={}",
+                query, filters, topK, conversationId);
+        List<CustomAiSearchResponse.Hit> hits = retrieveHits(query, filters, topK);
+
+        if (hits.isEmpty()) {
+            log.debug("Nessun chunk recuperato, risposta senza chiamata al LLM");
+            return Flux.just("Nessun documento trovato nel contesto richiesto.");
+        }
+
+        return chatClient.prompt()
+                .user("Domanda: " + query + "\n\nContesto:\n" + buildContext(hits))
+                .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, conversationId))
+                .stream()
+                .content()
+                .doOnNext(token -> log.debug("Risposta LLM (streaming) token: {}", token))
+                .doOnComplete(() -> log.debug("Streaming LLM completato"));
+    }
+
+    /**
+     * Retrieval vettoriale condiviso tra modalità sincrona e streaming: quando la domanda viene embeddata
+     * con lo STESSO modello usato in ingest (gemini-embedding-001, 768 dims) i vettori sono comparabili.
+     */
+    private List<CustomAiSearchResponse.Hit> retrieveHits(String query, Map<String, String> filters, int topK)
+            throws Exception {
         // 1) La domanda deve essere embeddata con lo STESSO modello usato in ingest
         //    (gemini-embedding-001, 768 dims) altrimenti i vettori non sono comparabili.
         List<Float> vector = toFloatList(embeddingModel.embed(query));
+        log.debug("Query embeddata, dimensione vettore: {}", vector.size());
 
         // 2) Filtri sui campi top-level: ogni coppia chiave/valore diventa una term query.
         //    Es. {"department":"operations"} -> {"term":{"department":"operations"}}.
@@ -87,6 +156,8 @@ public class CustomAiSearchService {
         // 4) Leggiamo il _source come Map generica (il client ES non conosce l'entity) e mappiamo
         //    i campi top-level sul record Hit. Nota: "embedding" è un dense_vector e NON compare
         //    mai in _source (comportamento di Elasticsearch): i campi top-level sì.
+        log.debug("Eseguo kNN search su indice '{}': topK={}, filtri={}", EsVectorSearchConfiguration.INDEX,
+                topK, filters);
         List<CustomAiSearchResponse.Hit> hits = new ArrayList<>();
         for (Hit<Map> hit : client.search(request, Map.class).hits().hits()) {
             Map source = hit.source();
@@ -95,26 +166,20 @@ public class CustomAiSearchService {
                     intVal(source.get("chunkIndex")), intVal(source.get("totalChunks")),
                     str(source.get("content")), hit.score()));
         }
+        log.debug("Recuperati {} chunk: {}", hits.size(), hits);
+        return hits;
+    }
 
-        // 5) Nessun chunk rilevante: risposta cortese, senza chiamare il LLM.
-        if (hits.isEmpty()) {
-            return new CustomAiSearchResponse("Nessun documento trovato nel contesto richiesto.", List.of());
-        }
-
-        // 6) Costruiamo il contesto per il LLM: chunk numerati, in ordine di score.
+    /**
+     * Costruisce il contesto per il LLM: chunk numerati, in ordine di score.
+     */
+    private static String buildContext(List<CustomAiSearchResponse.Hit> hits) {
         StringBuilder context = new StringBuilder();
         for (int i = 0; i < hits.size(); i++) {
             context.append("[Documento ").append(i + 1).append("]\n")
                     .append(hits.get(i).content()).append("\n\n");
         }
-
-        // 7) Generazione della risposta: il modello vede SOLO la domanda + i chunk recuperati.
-        String answer = chatClient.prompt()
-                .user("Domanda: " + query + "\n\nContesto:\n" + context)
-                .call()
-                .content();
-
-        return new CustomAiSearchResponse(answer, hits);
+        return context.toString();
     }
 
     /**

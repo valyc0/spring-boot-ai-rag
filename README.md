@@ -233,6 +233,20 @@ curl -s -G "http://localhost:8080/api/es/query" \
 
 La risposta è `{"answer": "...", "hits": [{id, contentId, langId, department, chunkIndex, totalChunks, content, score}]}`.
 
+**Query AI custom in streaming** (stessa kNN, ma la risposta del LLM arriva token per token via SSE,
+`text/event-stream`):
+```bash
+curl -N "http://localhost:8080/api/es/query/stream?question=quanto%20viene%20rimborsata%20la%20benzina%20in%20trasferta&topK=2"
+# variante con --data-urlencode (evita di percent-encodare a mano)
+curl -N -G "http://localhost:8080/api/es/query/stream" \
+  --data-urlencode "question=quali sono i dispositivi di protezione" \
+  --data-urlencode "topK=2" \
+  --data-urlencode "department=operations" \
+  --data-urlencode "langId=it-IT"
+```
+Ogni pezzo di testo arriva come evento SSE (`data:...`). Passando lo stesso `conversationId` (default
+`"default"`) il bot ricorda le risposte precedenti e può rispondere a domande di follow-up sul contenuto.
+
 Qui NON serve la pipeline `copy-meta`: i campi nascono già a livello top nell'entity.
 
 **Come funziona la query AI custom** (`CustomAiSearchService`):
@@ -313,6 +327,7 @@ contesto recuperato. La risposta contiene `answer` e `sources` (contentId dei ch
 | `/api/es/documents` | POST | Ingest custom Spring Data: text + contentId/langId/department → chunk + embed → ES |
 | `/api/es/documents?contentId=...` | GET | Rilettura chunk custom (senza embedding) |
 | `/api/es/query?question=...&topK=&contentId=&langId=&department=` | GET | Query AI custom: kNN + risposta LLM con filtri top-level |
+| `/api/es/query/stream?question=...&topK=&conversationId=&contentId=&langId=&department=` | GET | Come sopra ma risposta in streaming SSE, con memoria di conversazione |
 | `/api/search/ai?q=...` | POST | Ricerca AI filtrata (RAG) con body JSON opzionale |
 | `/api/embedding?text=...` | GET | Embedding di un testo (dimensioni/preview) |
 | `/api/cosine?text1=...&text2=...` | GET | Similarità coseno tra due testi |
