@@ -48,14 +48,22 @@ docker start elasticsearch
 
 ### 2. Inserire la chiave API
 
-La chiave è in `src/main/resources/application.properties`
-(`spring.ai.google.genai.api-key` e `spring.ai.google.genai.embedding.api-key`).
-Per non committarla, usa una variabile d'ambiente:
+`application.properties` legge la chiave da `${GEMINI_API_KEY}`.
+Il file `.env` (gitignored) viene caricato automaticamente all'avvio
+(`spring.config.import=optional:file:./.env[.properties]`):
+
+```bash
+cp .env.example .env
+# poi modifica .env e inserisci la chiave da https://aistudio.google.com/apikey
+```
+
+`.env`:
 
 ```properties
-spring.ai.google.genai.api-key=${GEMINI_API_KEY}
-spring.ai.google.genai.embedding.api-key=${spring.ai.google.genai.api-key}
+GEMINI_API_KEY=<la_tua_chiave>
 ```
+
+Alternativa: esporta la variabile d'ambiente (ha la precedenza su `.env`):
 
 ```bash
 export GEMINI_API_KEY=<la_tua_chiave>
